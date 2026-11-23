@@ -352,6 +352,51 @@ export function opencodeTmux(overrides: Options = {}): Plugin {
       await Promise.all(subscribers.map((sid) => flushSession(sid)))
     }
 
+    const readyTimeoutMs = overrides.driver ? 0 : 1500
+
+    function parseEventTsNs(ts: unknown): bigint {
+      if (typeof ts === "bigint") return ts
+      if (typeof ts === "number" && Number.isFinite(ts)) {
+        // Handle ms vs ns timestamps if a caller supplies ms in tests
+        return ts < 1e14 ? BigInt(Math.floor(ts)) * 1_000_000n : BigInt(Math.floor(ts))
+      }
+      if (typeof ts === "string" && /^\d+$/.test(ts.trim())) {
+        const val = BigInt(ts.trim())
+        return val < 100_000_000_000_000n ? val * 1_000_000n : val
+      }
+      return 0n
+    }
+
+    async function waitForPaneReady(paneId: string, afterNs: bigint): Promise<boolean> {
+      if (readyTimeoutMs <= 0) return true
+      const deadline = Date.now() + readyTimeoutMs
+      let baselineOffset = 0
+      try { baselineOffset = Math.max(0, fs.statSync(notifyLogPath).size - 8192) } catch {}
+      while (Date.now() < deadline && !shutdown.signal.aborted) {
+        try {
+          const stat = fs.statSync(notifyLogPath)
+          if (stat.size > baselineOffset) {
+            const buf = Buffer.alloc(stat.size - baselineOffset)
+            const fd = fs.openSync(notifyLogPath, "r")
+            fs.readSync(fd, buf, 0, buf.length, baselineOffset)
+            fs.closeSync(fd)
+            const lines = buf.toString("utf8").split("\n")
+            for (const line of lines) {
+              if (!line.includes(paneId)) continue
+              try {
+                const ev = JSON.parse(line) as { event?: string; pane?: string; ts?: unknown }
+                if (ev.event === "prompt" && ev.pane === paneId && parseEventTsNs(ev.ts) >= afterNs) {
+                  return true
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+        await Bun.sleep(40)
+      }
+      return false
+    }
+
     function processPromptLogLine(line: string) {
       const trimmed = line.trim()
       if (!trimmed) return
@@ -362,13 +407,18 @@ export function opencodeTmux(overrides: Options = {}): Plugin {
         return
       }
       if (event.event !== "prompt" || typeof event.pane !== "string" || !event.pane.startsWith("%")) return
+      const eventTsNs = parseEventTsNs(event.ts)
+      const meta = registry.getPaneMeta(event.pane)
+      if (meta && meta.armedAtNs > 0n && eventTsNs > 0n && eventTsNs <= meta.armedAtNs) return
+
+      const cmdNow = driver.paneCurrentCommand(event.pane)
+      // Stale prompt events must never clear a genuinely running command.
+      if (cmdNow && !isIdleShell(cmdNow)) return
+
       const dedupKey = `prompt:${event.pane}:${String(event.ts ?? "0")}`
       if (!registry.claimEvent(dedupKey)) return
 
-      const cmdNow = driver.paneCurrentCommand(event.pane)
-      if (!cmdNow || isIdleShell(cmdNow)) {
-        driver.unsetPaneOption(event.pane, PANE_AGENT_OPTION)
-      }
+      driver.unsetPaneOption(event.pane, PANE_AGENT_OPTION)
       const members = parsePaneSubs(driver.paneOption(event.pane, PANE_SUBS_OPTION))
       if (members.length > 0 || localTimers.has(event.pane)) {
         void completePane(event.pane, "complete")
@@ -731,21 +781,27 @@ export function opencodeTmux(overrides: Options = {}): Plugin {
         },
         async execute(args, context) {
           if (args.action === "split") {
+            const startedNs = BigInt(Date.now()) * 1_000_000n
             const target = args.target ?? process.env.TMUX_PANE
             const created = driver.splitPane({ target, direction: args.direction, cwd: args.cwd ?? input.directory })
             registry.recordOwnedPane(created.paneId, context.sessionID)
-            return JSON.stringify({ action: "split", ...created, owned: true }, null, 2)
+            const ready = await waitForPaneReady(created.paneId, startedNs)
+            return JSON.stringify({ action: "split", ...created, owned: true, ready }, null, 2)
           }
           if (args.action === "new_window") {
+            const startedNs = BigInt(Date.now()) * 1_000_000n
             const created = driver.newWindow({ targetSession: args.target, name: args.name, cwd: args.cwd ?? input.directory })
             registry.recordOwnedPane(created.paneId, context.sessionID)
-            return JSON.stringify({ action: "new_window", ...created, owned: true }, null, 2)
+            const ready = await waitForPaneReady(created.paneId, startedNs)
+            return JSON.stringify({ action: "new_window", ...created, owned: true, ready }, null, 2)
           }
           if (args.action === "new_session") {
             if (!args.name) throw new Error("`name` is required for action `new_session`.")
+            const startedNs = BigInt(Date.now()) * 1_000_000n
             const created = driver.newSession({ name: args.name, cwd: args.cwd ?? input.directory })
             registry.recordOwnedPane(created.paneId, context.sessionID)
-            return JSON.stringify({ action: "new_session", ...created, owned: true }, null, 2)
+            const ready = await waitForPaneReady(created.paneId, startedNs)
+            return JSON.stringify({ action: "new_session", ...created, owned: true, ready }, null, 2)
           }
           if (args.action === "rename") {
             if (!args.target || !args.name) throw new Error("`target` and `name` are required for action `rename`.")

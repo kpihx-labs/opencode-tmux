@@ -202,8 +202,13 @@ describe("opencode-tmux tools & bus", () => {
     const readOut = JSON.parse(await tools.tmux_read.execute({ target: "%1", lines: 5 }, ctxA))
     expect(readOut.output).toBe("out-a\nout-b")
 
-    // 8. Shell prompt return event in log triggers single <tmux-notify> & clears options
-    fs.appendFileSync(logPath, `${JSON.stringify({ event: "prompt", pane: "%1", ts: 999001 })}\n`)
+    // 8. Pre-arm prompt event (ts <= armedAtNs) MUST be ignored; post-arm event completes
+    fs.appendFileSync(logPath, `${JSON.stringify({ event: "prompt", pane: "%1", ts: 1 })}\n`)
+    await Bun.sleep(100)
+    expect(deliveries.filter((d) => d.sessionID === "ses_a" && d.text.includes("<tmux-notify>") && d.text.includes("%1"))).toHaveLength(0)
+
+    const futureNs = (BigInt(Date.now() + 60_000) * 1_000_000n).toString()
+    fs.appendFileSync(logPath, `${JSON.stringify({ event: "prompt", pane: "%1", ts: futureNs })}\n`)
     await Bun.sleep(120)
     const finalA = deliveries.filter((d) => d.sessionID === "ses_a" && d.text.includes("<tmux-notify>") && d.text.includes("%1"))
     expect(finalA).toHaveLength(1)
@@ -252,7 +257,8 @@ describe("opencode-tmux tools & bus", () => {
 
     const ctx = { sessionID: "ses_owner", agent: "Live", directory: "/work/a", abort: new AbortController().signal } as never
     await h1.tool?.tmux_send.execute({ target: "%7", command: "echo ok" }, ctx)
-    fs.appendFileSync(logPath, `${JSON.stringify({ event: "prompt", pane: "%7", ts: 777111 })}\n`)
+    const futureNs = (BigInt(Date.now() + 60_000) * 1_000_000n).toString()
+    fs.appendFileSync(logPath, `${JSON.stringify({ event: "prompt", pane: "%7", ts: futureNs })}\n`)
     await Bun.sleep(150)
 
     const finals = deliveries.filter((d) => d.sessionID === "ses_owner" && d.text.includes("<tmux-notify>"))
